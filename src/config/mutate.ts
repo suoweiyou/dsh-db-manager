@@ -294,19 +294,26 @@ export function resolveSecretField(
   if (mode === undefined || mode === 'keep') {
     return existing === undefined ? {} : { value: existing }
   }
+  // An empty value means "this profile simply has no such secret" — a private
+  // key without a passphrase is legal, and a client may send an untouched
+  // optional field anyway. Required-ness is enforced afterwards by
+  // sshProfileSchema's superRefine, which knows the auth method and therefore
+  // produces a method-specific message instead of a generic "empty" error.
   if (mode === 'env') {
     const envName = typeof input?.env === 'string' ? input.env.trim() : ''
+    if (envName.length === 0) return {}
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) return { error: `${label}：环境变量名不合法` }
     return { value: `$ENV:${envName}` }
   }
   if (mode === 'enc') {
     const cipher = typeof input?.enc === 'string' ? input.enc.trim() : ''
+    if (cipher.length === 0) return {}
     if (!cipher.startsWith('enc:v1:')) return { error: `${label}：密文必须是 enc:v1:… 形式` }
     return { value: cipher }
   }
   // mode === 'plain'
   const plain = typeof input?.plain === 'string' ? input.plain : ''
-  if (plain.length === 0) return { error: `${label}：明文不能为空` }
+  if (plain.length === 0) return {}
   return { value: encryptToSecret(plain) }
 }
 

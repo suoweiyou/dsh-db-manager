@@ -216,7 +216,7 @@ export function verifyHostKeyAgainstKnownHosts(options: {
   }
 
   const hint = options.port === DEFAULT_SSH_PORT ? options.host : `[${options.host}]:${options.port}`
-  return { ok: false, reason: `known_hosts 中没有 ${options.host}:${options.port} 的记录（严格校验要求先用 ssh 登录一次并把主机密钥写入 known_hosts；非 22 端口需 ${hint} 形式的条目）` }
+  return { ok: false, reason: `known_hosts 中没有 ${options.host}:${options.port} 的记录（严格校验，不接受首次信任；非 22 端口在 known_hosts 中记作 ${hint}）` }
 }
 
 /* ── tunnel ──────────────────────────────────────────────────────────────── */
@@ -245,6 +245,70 @@ function expandHome(filePath: string): string {
   if (filePath === '~') return os.homedir()
   if (filePath.startsWith('~/') || filePath.startsWith('~\\')) return path.join(os.homedir(), filePath.slice(2))
   return filePath
+}
+
+/** The auth facts needed to print a copy-pasteable manual `ssh` command. */
+export interface ManualSshHintInput {
+  host: string
+  port: number
+  username: string
+  /** Profile auth method, plus its key path when it authenticates with a key file. */
+  auth?: { method: SshAuthSpec['method']; keyPath?: string }
+}
+
+/** Quote an argument only when cmd / PowerShell would otherwise split it. */
+function shellArg(value: string): string {
+  return /[\s"]/.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value
+}
+
+/**
+ * The exact `ssh` command a human can paste into PowerShell or cmd to log in
+ * once — that first login is what writes the host key into known_hosts.
+ * Ports other than 22 need `-p`, key-file auth needs `-i`, and a custom
+ * known_hosts file needs `-o UserKnownHostsFile=…` (otherwise the key lands in
+ * the default file and the plugin would still refuse it).
+ */
+export function manualSshCommand(input: ManualSshHintInput & { knownHostsPath?: string }): string {
+  const parts = ['ssh']
+  if (input.port !== DEFAULT_SSH_PORT) parts.push('-p', String(input.port))
+  const keyPath = input.auth?.method === 'keyfile' ? (input.auth.keyPath ?? '').trim() : ''
+  if (keyPath !== '') parts.push('-i', shellArg(expandHome(keyPath)))
+  const knownHosts = input.knownHostsPath === undefined ? '' : expandHome(input.knownHostsPath)
+  const defaultKnownHosts = path.join(os.homedir(), '.ssh', 'known_hosts')
+  if (knownHosts !== '' && path.resolve(knownHosts) !== path.resolve(defaultKnownHosts)) {
+    parts.push('-o', shellArg(`UserKnownHostsFile=${knownHosts}`))
+  }
+  parts.push(`${input.username}@${input.host}`)
+  return parts.join(' ')
+}
+
+/**
+ * Copy-pasteable fix for "this host key is not in known_hosts".
+ * A generic "ssh once first" left users without any command to type, so this
+ * spells out one command for their auth method, the file it must land in, and
+ * a non-interactive fallback.
+ */
+export function knownHostsFixHint(input: ManualSshHintInput & {
+  knownHostsPath: string
+  /** Fetch exactly this key type (multi-key server where the type is missing). */
+  keyType?: string
+}): string {
+  const endpoint = input.port === DEFAULT_SSH_PORT ? input.host : `${input.host}:${input.port}`
+  const knownHosts = expandHome(input.knownHostsPath)
+  const portFlag = input.port === DEFAULT_SSH_PORT ? '' : ` -p ${input.port}`
+  const typeFlag = input.keyType === undefined ? '' : ` -t ${input.keyType}`
+  const lines = [
+    `在 PowerShell 或 cmd 里手动登录一次 ${endpoint}（核对指纹后输入 yes，主机密钥即写入 known_hosts）：`,
+    `  ${manualSshCommand(input)}`,
+    `目标文件：${knownHosts}`,
+  ]
+  const method = input.auth?.method
+  if (method === 'password') lines.push('（该命令会提示输入跳板机账号的密码）')
+  if (method === 'key') lines.push('（内联 PEM 无法直接交给 ssh：请改用密码或 ssh-agent 登录一次，或把 PEM 存成文件后用 -i 指定）')
+  if (method === 'keyfile' && (input.auth?.keyPath ?? '').trim() === '') lines.push('（未填写私钥路径：命令使用默认私钥，非默认私钥请加 -i <私钥文件>）')
+  lines.push('若无法交互登录（无人值守），可只取公钥——务必先与服务器管理员核对指纹：')
+  lines.push(`  ssh-keyscan${portFlag}${typeFlag} ${input.host} >> ${shellArg(knownHosts)}`)
+  return lines.join('\n')
 }
 
 /** Windows OpenSSH agent named pipe; POSIX uses SSH_AUTH_SOCK. */
@@ -329,14 +393,33 @@ async function connectSsh(profile: SshProfileSpec, options: SshConnectOptions): 
   const context = `SSH 连接（配置 ${profile.name} → ${endpoint}）`
 
   const knownHostsPath = expandHome(profile.knownHostsPath ?? DEFAULT_KNOWN_HOSTS)
+
+  /**
+   * One actionable block reused by every "host key is not trusted" failure:
+   * the exact `ssh` command for this profile's auth method, the file the key
+   * must land in, and a non-interactive fallback.
+   */
+  const manualHint = (extra?: { keyType?: string }): string =>
+    knownHostsFixHint({
+      host: profile.host,
+      port: profile.port ?? DEFAULT_SSH_PORT,
+      username: profile.username,
+      auth: {
+        method: profile.auth.method,
+        ...(profile.auth.keyPath === undefined ? {} : { keyPath: profile.auth.keyPath }),
+      },
+      knownHostsPath,
+      ...(extra?.keyType === undefined ? {} : { keyType: extra.keyType }),
+    })
+
   let knownHostsText: string
   try {
     knownHostsText = fs.readFileSync(knownHostsPath, 'utf8')
   } catch (error) {
     throw new SshError(
       'config',
-      `${context}：无法读取 known_hosts（${knownHostsPath}）：${error instanceof Error ? error.message : String(error)}。主机密钥为严格校验，请先手动 ssh 一次以写入该文件，或在 SSH 配置中指定 knownHostsPath`,
-      '请先手动 ssh 登录该跳板机以写入 known_hosts，或在 SSH 配置中指定 knownHostsPath',
+      `${context}：无法读取 known_hosts（${knownHostsPath}）：${error instanceof Error ? error.message : String(error)}。主机密钥为严格校验，需先把该主机密钥写入这个文件；若这不是你想用的文件，请在 SSH 配置里改 knownHostsPath`,
+      manualHint(),
     )
   }
 
@@ -386,8 +469,16 @@ async function connectSsh(profile: SshProfileSpec, options: SshConnectOptions): 
       // Strict: reject anything not already present in known_hosts. ssh2 calls
       // this synchronously with the raw SSH wire-format public key.
       hostVerifier: (key: Buffer) => {
-        const verdict = verifyHostKeyAgainstKnownHosts({ knownHostsText, host: profile.host, port: profile.port ?? DEFAULT_SSH_PORT, keyBlob: key })
-        if (!verdict.ok) throw new SshError('config', `${context}：${verdict.reason}`, '主机密钥为严格校验（不接受首次信任）：请先手动 ssh 登录该跳板机并把主机密钥写入 known_hosts，或修正 SSH 配置中的 knownHostsPath')
+        const port = profile.port ?? DEFAULT_SSH_PORT
+        const verdict = verifyHostKeyAgainstKnownHosts({ knownHostsText, host: profile.host, port, keyBlob: key })
+        if (!verdict.ok) {
+          // Name the exact key type only when the host IS recorded but this type
+          // is missing — then `ssh-keyscan -t <type>` is what fills the gap.
+          const recorded = recordedHostKeyTypes(knownHostsText, profile.host, port)
+          const presented = sshKeyTypeOf(key)
+          const extra: { keyType?: string } = recorded.length > 0 && presented !== undefined ? { keyType: presented } : {}
+          throw new SshError('config', `${context}：${verdict.reason}`, manualHint(extra))
+        }
         return true
       },
     }

@@ -78,8 +78,13 @@ type EditorState =
       sshProfile: string
     }
 
-/** How a secret field is supplied from the page (mirrors the connection password modes). */
-type SecretMode = 'keep' | 'plain' | 'env' | 'enc'
+/**
+ * How a secret field is supplied from the page (mirrors the connection password
+ * modes). `none` is not a user-selectable mode: the page emits it when the
+ * field was left empty, so the Host stores no secret at all (e.g. a private
+ * key without a passphrase).
+ */
+type SecretMode = 'keep' | 'plain' | 'env' | 'enc' | 'none'
 
 export type SshEditorState =
   | { open: false }
@@ -418,12 +423,20 @@ export function DbManagerSection(_props: { close: () => void }): ReactElement {
         env: string,
         plain: string,
         enc: string,
-      ): { mode: SecretMode; env?: string; plain?: string; enc?: string } => ({
-        mode,
-        ...(mode === 'env' ? { env: env.trim() } : {}),
-        ...(mode === 'plain' ? { plain } : {}),
-        ...(mode === 'enc' ? { enc: enc.trim() } : {}),
-      })
+      ): { mode: SecretMode; env?: string; plain?: string; enc?: string } => {
+        if (mode === 'keep') return { mode }
+        // Empty input means "this profile has no such secret". Sending it as
+        // `{ mode: 'env', env: '' }` made the Host reject the whole form with
+        // "环境变量名不合法" — a passphrase-less key could not be saved at all.
+        const value = mode === 'env' ? env.trim() : mode === 'enc' ? enc.trim() : plain
+        if (value.length === 0) return { mode: 'none' }
+        return {
+          mode,
+          ...(mode === 'env' ? { env: value } : {}),
+          ...(mode === 'plain' ? { plain } : {}),
+          ...(mode === 'enc' ? { enc: value } : {}),
+        }
+      }
       const profile: Record<string, unknown> = {
         name: sshEditor.name.trim(),
         host: sshEditor.host.trim(),
@@ -794,7 +807,7 @@ export function DbManagerSection(_props: { close: () => void }): ReactElement {
   if (notice !== null) {
     children.push(
       h('div', { key: 'notice', style: { marginBottom: 12, padding: '10px 12px', borderRadius: 10, border: `1px solid ${C.border}`, color: C.textSecondary, fontSize: 12, display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
-        h('span', { style: { minWidth: 0, wordBreak: 'break-word' } }, notice),
+        h('span', { style: { minWidth: 0, wordBreak: 'break-word', whiteSpace: 'pre-wrap' } }, notice),
         h('button', { style: { ...buttonStyle, fontSize: 12 }, onClick: () => setNotice(null) }, '知道了'),
       ),
     )
@@ -1031,11 +1044,11 @@ export function renderSshCard(profile: SshProfileView, status: TestResultView | 
           : h('button', { style: buttonStyle, onClick: handlers.onDeleteAsk }, '删除'),
       ),
     ),
-    h('div', { style: { marginTop: 4, color: status?.ok === false ? C.bad : C.textSecondary, fontSize: 12, wordBreak: 'break-word' } },
+    h('div', { style: { marginTop: 4, color: status?.ok === false ? C.bad : C.textSecondary, fontSize: 12, wordBreak: 'break-word', whiteSpace: 'pre-wrap' } },
       busy ? '正在建立 SSH 连接（校验主机密钥与认证）…' : summary.text,
     ),
     status?.ok === false && status.hint !== undefined
-      ? h('div', { style: { marginTop: 2, color: C.textTertiary, fontSize: 11, wordBreak: 'break-word' } }, `建议：${status.hint}`)
+      ? h('div', { style: { marginTop: 2, color: C.textTertiary, fontSize: 11, wordBreak: 'break-word', whiteSpace: 'pre-wrap', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' } }, `建议：${status.hint}`)
       : null,
     h('div', { style: { marginTop: 4, color: C.textTertiary, fontSize: 11, wordBreak: 'break-all' } },
       [
@@ -1137,7 +1150,7 @@ export function renderSshEditor(editor: Extract<SshEditorState, { open: true }>,
     editor.authMethod === 'keyfile' ? h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, field('私钥文件路径 *', 'keyPath', { placeholder: '~/.ssh/id_rsa' })) : null,
     secretBlock('私钥内容', 'privateKey', editor.authMethod === 'key'),
     secretBlock('密码', 'password', editor.authMethod === 'password'),
-    secretBlock('私钥口令', 'passphrase', editor.authMethod === 'keyfile' || editor.authMethod === 'key'),
+    secretBlock('私钥口令（留空表示私钥无口令）', 'passphrase', editor.authMethod === 'keyfile' || editor.authMethod === 'key'),
     h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
       field('known_hosts 路径（留空用默认 ~/.ssh/known_hosts）', 'knownHostsPath'),
     ),

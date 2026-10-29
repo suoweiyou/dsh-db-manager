@@ -19,7 +19,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { deleteSshProfileFrom, saveSshProfileInto, resolveSecretField } from '../src/config/mutate.js'
 import { sshProfileSchema } from '../src/config/schema.js'
 import { ConfigStore } from '../src/config/store.js'
-import { DEFAULT_HOST_KEY_ALGORITHMS, hostKeyAlgorithmPreference, knownHostCandidates, openSshTunnel, probeSshProfile, recordedHostKeyTypes, sshKeyTypeOf, verifyHostKeyAgainstKnownHosts } from '../src/db/ssh-tunnel.js'
+import { DEFAULT_HOST_KEY_ALGORITHMS, hostKeyAlgorithmPreference, knownHostCandidates, knownHostsFixHint, manualSshCommand, openSshTunnel, probeSshProfile, recordedHostKeyTypes, sshKeyTypeOf, verifyHostKeyAgainstKnownHosts } from '../src/db/ssh-tunnel.js'
 import type { ConnectionSpec, SshProfileSpec } from '../src/shared/types.js'
 
 const dirs: string[] = []
@@ -229,6 +229,43 @@ describe('host key algorithm preference — negotiate a type we already trust', 
   })
 })
 
+describe('known_hosts fix hint — one copy-pasteable command', () => {
+  const knownHostsPath = 'C:\\Users\\tester\\.ssh\\known_hosts'
+
+  it('builds the exact ssh command for a non-22 port with password auth', () => {
+    expect(manualSshCommand({ host: '203.0.113.10', port: 10222, username: 'deploy', auth: { method: 'password' } }))
+      .toBe('ssh -p 10222 deploy@203.0.113.10')
+  })
+
+  it('adds -i for key-file auth and omits -p on the default port', () => {
+    expect(manualSshCommand({ host: '203.0.113.10', port: 22, username: 'deploy', auth: { method: 'keyfile', keyPath: 'C:\\keys\\id_ed25519' } }))
+      .toBe('ssh -i C:\\keys\\id_ed25519 deploy@203.0.113.10')
+  })
+
+  it('points ssh at a custom known_hosts so the key lands where the plugin reads it', () => {
+    const cmd = manualSshCommand({ host: '203.0.113.10', port: 10222, username: 'deploy', auth: { method: 'agent' }, knownHostsPath: 'D:\\profiles\\kh' })
+    expect(cmd).toContain('-o UserKnownHostsFile=D:\\profiles\\kh')
+  })
+
+  it('spells out the command, the target file and the keyscan fallback', () => {
+    const hint = knownHostsFixHint({ host: '203.0.113.10', port: 10222, username: 'deploy', auth: { method: 'password' }, knownHostsPath })
+    // The command carries -o UserKnownHostsFile=… because this profile keeps
+    // known_hosts outside the default location — a plain `ssh` would write the
+    // key somewhere the plugin never reads.
+    expect(hint).toContain('ssh -p 10222')
+    expect(hint).toContain('deploy@203.0.113.10')
+    expect(hint).toContain(`UserKnownHostsFile=${knownHostsPath}`)
+    expect(hint).toContain(`目标文件：${knownHostsPath}`)
+    expect(hint).toContain('ssh-keyscan -p 10222 203.0.113.10')
+    expect(hint).toContain('密码')
+  })
+
+  it('narrows keyscan to the negotiated key type when only that type is missing', () => {
+    const hint = knownHostsFixHint({ host: '203.0.113.10', port: 2222, username: 'deploy', auth: { method: 'agent' }, knownHostsPath, keyType: 'ecdsa-sha2-nistp256' })
+    expect(hint).toContain('ssh-keyscan -p 2222 -t ecdsa-sha2-nistp256 203.0.113.10')
+  })
+})
+
 describe('sshProfileSchema — validation', () => {
   it('accepts a keyfile profile', () => {
     const parsed = sshProfileSchema.safeParse({
@@ -275,6 +312,19 @@ describe('resolveSecretField — same policy as database passwords', () => {
     expect(resolveSecretField({ mode: 'enc', enc: 'not-a-cipher' }, undefined, 'p').error).toContain('enc:v1')
     expect(resolveSecretField({ mode: 'none' }, 'enc:v1:x:y:z', 'p')).toEqual({})
   })
+
+  it('treats an empty value as "no secret" instead of an error', () => {
+    // A private key without a passphrase is legal, and the SSH editor used to
+    // send its untouched passphrase field as `{ mode: 'env', env: '' }`, which
+    // was rejected as "环境变量名不合法" — the profile could not be saved at all.
+    expect(resolveSecretField({ mode: 'env', env: '' }, undefined, 'SSH 私钥口令')).toEqual({})
+    expect(resolveSecretField({ mode: 'env', env: '   ' }, undefined, 'SSH 私钥口令')).toEqual({})
+    expect(resolveSecretField({ mode: 'plain', plain: '' }, undefined, 'SSH 私钥口令')).toEqual({})
+    expect(resolveSecretField({ mode: 'enc', enc: '' }, undefined, 'SSH 私钥口令')).toEqual({})
+    // An empty value must not silently keep a stale secret either: `none`
+    // clears it, `keep` is the only way to preserve one.
+    expect(resolveSecretField({ mode: 'env', env: '' }, 'enc:v1:x:y:z', 'SSH 私钥口令')).toEqual({})
+  })
 })
 
 describe('saveSshProfileInto / deleteSshProfileFrom', () => {
@@ -299,6 +349,25 @@ describe('saveSshProfileInto / deleteSshProfileFrom', () => {
     expect(raw).not.toContain('hunter2')
     const auth = read(file).sshProfiles?.[0]?.['auth'] as Record<string, unknown>
     expect(String(auth['password']).startsWith('enc:v1:')).toBe(true)
+  })
+
+  it('accepts a keyfile profile whose private key has no passphrase', () => {
+    const { store: s, file } = store()
+    const outcome = saveSshProfileInto(s, { scope: 'global' }, {
+      profile: { name: 'jump', host: '10.0.0.5', username: 'deploy', auth: { method: 'keyfile', keyPath: '~/.ssh/id_ed25519', passphrase: { mode: 'none' } } },
+    })
+    expect(outcome.ok).toBe(true)
+    expect(outcome.action).toBe('created')
+    expect('passphrase' in (read(file).sshProfiles?.[0]?.['auth'] as Record<string, unknown>)).toBe(false)
+    // Regression: the GUI used to submit the untouched passphrase field as
+    // `{ mode: 'env', env: '' }`; that must mean "no passphrase", not an error.
+    const legacy = saveSshProfileInto(s, { scope: 'global' }, {
+      originalName: 'jump',
+      profile: { name: 'jump', host: '10.0.0.5', username: 'deploy', auth: { method: 'keyfile', keyPath: '~/.ssh/id_ed25519', passphrase: { mode: 'env', env: '' } } },
+    })
+    expect(legacy.ok).toBe(true)
+    expect(legacy.action).toBe('replaced')
+    expect('passphrase' in (read(file).sshProfiles?.[0]?.['auth'] as Record<string, unknown>)).toBe(false)
   })
 
   it('refuses a duplicate name, and replaces when originalName is given', () => {

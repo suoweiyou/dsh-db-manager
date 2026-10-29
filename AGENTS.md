@@ -46,7 +46,7 @@ DSH 双端 Cordis 插件：MySQL / PostgreSQL / SQLite 连接注册中心 + 设�
 
 ## 5. 改动收尾（强制，见开发规范 §6.1）
 
-1. 在 [`docs/PROJECT.md`](docs/PROJECT.md) 的「变更日志（索引）」追加一行：`版本区间 | 日期 | 主题 | 类型 | 一句话说明 | 详情链接`——**任何变更都要**。
+1. 在 [`docs/PROJECT.md`](docs/PROJECT.md) 的「变更日志（索引）」**末尾追加一行**：`# | 版本区间 | 日期 | 主题 | 类型 | 一句话说明 | 详情链接`——**任何变更都要**；`#` 取上一行 +1（只增、不重排、不复用），整表按 `日期` 正序，所以新行天然在末尾。
 2. **只有代码/发版变更**（`src/`、`tests/`、`bin/`、`scripts/`、`package.json`、`cordis.patch*.yml` 有改动，或发布新版本）才新建/更新 `docs/CHANGELOG-v<版本>-<主题>.md`，套用开发规范 §6.1 的模板；**纯文档/流程变更（README、AGENTS.md、`docs/*.md`）不建 CHANGELOG**，详情链接填 `本提交说明`。
 3. 代码变更把 §5.1 验证矩阵结果写进 CHANGELOG 的「运行验证」小节。
 4. 文档只保留**单一最终版**，不写版本对比；`CHANGELOG-*` 只增不改史；`docs/records/` 不改写既有事实。

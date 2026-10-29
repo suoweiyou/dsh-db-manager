@@ -1,7 +1,15 @@
 {
   "name": "dsh-db-manager",
   "description": "DeepSeek Harness dual-face plugin: MySQL / PostgreSQL / SQLite connection registry with a settings-page management GUI, health tests, shadow backups, and safe AI query tools",
-  "version": "0.1.0",
+  "version": "0.21.1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/suoweiyou/dsh-db-manager.git"
+  },
+  "homepage": "https://github.com/suoweiyou/dsh-db-manager#readme",
+  "bugs": {
+    "url": "https://github.com/suoweiyou/dsh-db-manager/issues"
+  },
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
