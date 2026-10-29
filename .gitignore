@@ -1,0 +1,38 @@
+# ---- 依赖 ----
+node_modules/
+
+# ---- 构建产物（tsup 输出 lib/；run-vitest/verify 的 tsc 输出 .build/）----
+lib/
+.build/
+dist/
+*.tsbuildinfo
+
+# ---- 测试 / 覆盖率 ----
+coverage/
+.vitest/
+
+# ---- 日志 ----
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- 本地环境与密钥（数据库凭据、secret.key 等，严禁入库）----
+.env
+.env.*
+!.env.example
+
+# ---- npm 打包产物 ----
+*.tgz
+
+# ---- 编辑器 / IDE ----
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+Desktop.ini

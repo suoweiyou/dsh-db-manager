@@ -1,0 +1,30 @@
+# dsh-db-manager 挂载示例
+#
+# 用法：把下面的 insert 块追加到部署 profile 的 cordis.patch.yml
+# （即 DSH 读取的 composition 补丁；也可加入自定义 --patch 覆盖层），
+# 然后重启 DSH。插件行同时挂载 Host 半区（模型工具 + RPC 路由）
+# 与 Client 半区（设置页「数据库」分区，经包内 dsh.client 声明装配）。
+#
+# 注意：
+# - 本包可复制到 DSH 可解析的 node_modules 内；更推荐目录联接（Junction）
+#   指向本工作区，构建后重启即生效：
+#   New-Item -ItemType Junction -Path <profile>/node_modules/dsh-db-manager -Target <本目录>
+# - rpcEnabled: false 可关闭设置页 GUI 的 RPC 路由（仅保留模型工具）。
+# - auditEnabled: false 可关闭审计 JSONL（~/.dsh/db-manager/audit/）。
+
+- insert:
+    - id: db-manager
+      name: dsh-db-manager
+      config:
+        connectTimeoutMs: 5000
+        queryTimeoutMs: 15000
+        maxRows: 200
+        backupEnabled: true
+        backupMaxRows: 100000
+        # v0.10 — backup policy. 'always' (legacy): every UPDATE/DELETE backs up.
+        # 'small-only' (default since v0.10): back up only when affectedEstimate
+        # is ≤ backupSmallThreshold. 'opt-in': never unless withBackup:true.
+        backupDefault: small-only
+        backupSmallThreshold: 1000
+        auditEnabled: true
+        rpcEnabled: true

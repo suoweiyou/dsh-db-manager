@@ -1,0 +1,14 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+# This file is what `dsh plugin add dsh-db-manager` (and the plugin market)
+# applies automatically — no manual patch editing is needed on market installs.
+- insert:
+    - id: db-manager
+      name: 'dsh-db-manager'
+      config:
+        connectTimeoutMs: 5000
+        queryTimeoutMs: 15000
+        maxRows: 200
+        backupEnabled: true
+        backupMaxRows: 100000
+        auditEnabled: true
+        rpcEnabled: true
