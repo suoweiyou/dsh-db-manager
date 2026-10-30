@@ -48,6 +48,12 @@ const Config = z.object({
   backupSmallThreshold: z.number().min(0).default(1000),
   auditEnabled: z.boolean().default(true),
   rpcEnabled: z.boolean().default(true),
+  // FR-22 (v0.22) — read-only SSH log sources. Three knobs only: the output
+  // quota (one number, the settings page renders it as a plain input), the
+  // per-read timeout, and an emergency stop that unregisters the four tools.
+  logEnabled: z.boolean().default(true),
+  logMaxBytes: z.number().min(1000).max(1_000_000).default(100_000),
+  logTimeoutMs: z.number().min(1000).max(120_000).default(10_000),
 })
 
 interface HostContext {
@@ -68,6 +74,9 @@ interface ResolvedConfig {
   backupSmallThreshold: number
   auditEnabled: boolean
   rpcEnabled: boolean
+  logEnabled: boolean
+  logMaxBytes: number
+  logTimeoutMs: number
 }
 
 /**
@@ -122,6 +131,9 @@ function apply(ctx: HostContext, config: ResolvedConfig): void {
     backupDefault: config.backupDefault,
     backupSmallThreshold: config.backupSmallThreshold,
     requestApproval: approvalRequester(ctx),
+    logEnabled: config.logEnabled,
+    logMaxBytes: config.logMaxBytes,
+    logTimeoutMs: config.logTimeoutMs,
   }
   for (const tool of buildTools(deps)) {
     ctx.tools.register(tool)

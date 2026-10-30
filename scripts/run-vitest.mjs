@@ -17,6 +17,7 @@ const SPECS = [
   'tests/build-info.spec.ts',
   'tests/cipher.spec.ts',
   'tests/client-render.spec.ts',
+  'tests/client-test-all.spec.ts',
   'tests/config.spec.ts',
   'tests/confirm.spec.ts',
   'tests/errors.spec.ts',
@@ -26,6 +27,7 @@ const SPECS = [
   'tests/rpc-tables.spec.ts',
   'tests/safety.spec.ts',
   'tests/ssh.spec.ts',
+  'tests/ssh-logs.spec.ts',
   'tests/usage.spec.ts',
   'tests/workspaces.spec.ts',
 ]

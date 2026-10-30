@@ -9,7 +9,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { connectionSchema, globalConfigSchema, workspaceConfigSchema, type GlobalConfig, type WorkspaceConfig } from './schema.js'
-import type { ConnectionScope, ConnectionSpec, SshProfileSpec } from '../shared/types.js'
+import type { ConnectionScope, ConnectionSpec, SshLogSourceSpec, SshProfileSpec } from '../shared/types.js'
 
 export function defaultGlobalConfigPath(): string {
   const base = process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh')
@@ -50,6 +50,13 @@ export interface ResolvedSet {
   connections: ResolvedConnection[]
   defaultName?: string
   warnings: string[]
+}
+
+/** FR-22: one whitelisted log source together with the profile that declares it. */
+export interface ResolvedLogSource {
+  profile: SshProfileSpec
+  source: SshLogSourceSpec
+  scope: ConnectionScope
 }
 
 const EMPTY_GLOBAL: FileLoad<GlobalConfig> = { path: '', exists: false, warnings: [] }
@@ -146,6 +153,52 @@ export class ConfigStore {
     return {
       error: `连接 "${spec.name}" 引用的 SSH 配置 "${wanted}" 不存在（可用：${[...globalProfiles, ...workspaceProfiles].map((p) => p.name).join('、') || '无'}）`,
     }
+  }
+
+  /**
+   * FR-22 — resolve one read-only log source by name. Precedence matches
+   * `resolveSshProfile` (workspace profile shadows the global one), and the
+   * source name is matched inside that profile's whitelist only — there is no
+   * path/glob matching anywhere in this lookup.
+   */
+  resolveLogSource(
+    load: ConfigLoad,
+    profileName: string,
+    sourceName: string,
+  ): { resolved?: ResolvedLogSource; error?: string } {
+    const visible = this.visibleSshProfiles(load)
+    const profile = visible.find((entry) => entry.profile.name === profileName)
+    if (profile === undefined) {
+      const names = visible.map((entry) => entry.profile.name)
+      return { error: `SSH 配置 "${profileName}" 不存在（可用：${names.join('、') || '无'}）` }
+    }
+    const sources = profile.profile.logSources ?? []
+    if (sources.length === 0) {
+      return {
+        error: `SSH 配置 "${profileName}" 尚未登记任何日志源（可在设置页该 SSH 配置的「日志源白名单」里填写，或用 db_add_ssh_log_source 添加）`,
+      }
+    }
+    const source = sources.find((entry) => entry.name === sourceName)
+    if (source === undefined) {
+      return { error: `SSH 配置 "${profileName}" 里没有名为 "${sourceName}" 的日志源（可用：${sources.map((entry) => entry.name).join('、')}）` }
+    }
+    return { resolved: { profile: profile.profile, source, scope: profile.scope } }
+  }
+
+  /**
+   * Every SSH profile visible in this workspace (workspace first, then global
+   * entries the workspace does not shadow). Used by `db_list_ssh_logs` so the
+   * model can see which logs exist before asking for one.
+   */
+  visibleSshProfiles(load: ConfigLoad): Array<{ profile: SshProfileSpec; scope: ConnectionScope }> {
+    const byName = new Map<string, { profile: SshProfileSpec; scope: ConnectionScope }>()
+    for (const profile of load.global.data?.sshProfiles ?? []) {
+      byName.set(profile.name, { profile, scope: 'global' })
+    }
+    for (const profile of load.workspace?.data?.sshProfiles ?? []) {
+      byName.set(profile.name, { profile, scope: 'workspace' })
+    }
+    return [...byName.values()]
   }
 
   /** Read + validate one config file with per-entry granularity and mtime cache. */

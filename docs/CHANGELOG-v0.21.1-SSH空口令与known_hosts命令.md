@@ -64,6 +64,7 @@ SSH 连接（配置 jump-prod → 203.0.113.10:10222）：known_hosts 中没有 
 - 代码：`src/config/mutate.ts`（`resolveSecretField` 空值语义）、`src/client/Section.ts`（`SecretMode` + `secret()` + 口令标签 + `pre-wrap` 渲染）
 - 代码：`src/db/ssh-tunnel.ts`（新增 `manualSshCommand` / `knownHostsFixHint`，两处 known_hosts 失败出口改用之，`connectSsh` 统一 `manualHint()`）
 - 测试：`tests/ssh.spec.ts` 新增 7 例（`resolveSecretField` 空值、无口令 keyfile 保存、命令拼装 5 例）
+- 打包：`package.json#files` 增加 `docs/img`——README 新增「界面预览」4 张截图（`docs/img/`）与根目录 `screenshots.json`，随包发布后 npm 页面也能渲染相对路径图片
 - 文档：本文、`docs/PROJECT.md` 索引行、`docs/需求设计文档.md` FR-13 补充「口令可留空」
 - 版本：`package.json` → `0.21.1`
 

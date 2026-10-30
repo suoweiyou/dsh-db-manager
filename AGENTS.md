@@ -20,7 +20,7 @@
 
 ## 2. 项目一句话
 
-DSH 双端 Cordis 插件：MySQL / PostgreSQL / SQLite 连接注册中心 + 设置页管理 GUI + 9 个 `db_*` 模型工具。Host 半区是 ESM（`src/index.ts` → `lib/index.js`），Client 半区是 CJS ModuleLoader 模块（`src/client/main.ts` → `lib/client.js`）。
+DSH 双端 Cordis 插件：MySQL / PostgreSQL / SQLite 连接注册中心 + 设置页管理 GUI + 13 个 `db_*` 模型工具（含 v0.22 的 4 个 SSH 只读日志工具）。Host 半区是 ESM（`src/index.ts` → `lib/index.js`），Client 半区是 CJS ModuleLoader 模块（`src/client/main.ts` → `lib/client.js`）。
 
 ## 3. 硬约束速查（完整条款见开发规范 §1 / §2 / §4）
 

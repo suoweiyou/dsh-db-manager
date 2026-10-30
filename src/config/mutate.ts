@@ -23,7 +23,7 @@ import path from 'node:path'
 import { connectionSchema, formatZodIssues, sshProfileSchema } from './schema.js'
 import { workspaceConfigPath, type ConfigStore } from './store.js'
 import { encryptToSecret } from '../secrets.js'
-import type { ConnectionSpec, SshProfileSpec } from '../shared/types.js'
+import type { ConnectionSpec, SshLogSourceSpec, SshProfileSpec } from '../shared/types.js'
 
 export type ConnectionScope = 'global' | 'workspace'
 
@@ -364,6 +364,19 @@ export function saveSshProfileInto(
     return typeof value === 'string' ? value : undefined
   }
 
+  // FR-22 merge protection: this save REPLACES the whole entry, while the GUI
+  // editor renders only a subset of the fields. Without this rule, changing the
+  // password in the settings page would silently drop the log-source whitelist.
+  // Semantics: `logSources` absent → keep what is on disk; explicit `[]` → clear;
+  // explicit `null` → clear (GUI "清空").
+  const logSourcesInput = draft['logSources']
+  if (logSourcesInput === null) {
+    delete draft['logSources']
+  } else if (logSourcesInput === undefined && existingEntry !== undefined) {
+    const stored = existingEntry['logSources']
+    if (stored !== undefined) draft['logSources'] = stored
+  }
+
   const method = typeof authInput.method === 'string' ? authInput.method : ''
   const auth: Record<string, unknown> = { method }
   if (typeof authInput.keyPath === 'string' && authInput.keyPath.trim().length > 0) auth.keyPath = authInput.keyPath.trim()
@@ -424,6 +437,108 @@ export function deleteSshProfileFrom(
 export function deleteSshProfile(store: ConfigStore, name: string): { ok: boolean; error?: string } {
   return deleteSshProfileFrom(store, { scope: 'global' }, name)
 }
+
+/* ── FR-22: log-source whitelist mutations ───────────────────────────────── */
+
+export interface LogSourceSaveOutcome {
+  ok: boolean
+  error?: string
+  warnings?: string[]
+  path?: string
+  action?: 'created' | 'replaced' | 'deleted'
+  scope?: ConnectionScope
+  /** Non-fatal note (e.g. the profile also exists in the other file). */
+  warning?: string
+}
+
+/**
+ * FR-22 — add / update / delete ONE log source on an existing SSH profile.
+ *
+ * Used by `db_add_ssh_log_source` so a log can be registered in the middle of a
+ * conversation. Deliberate limits:
+ *   - only the `logSources` array of that one profile is touched — credentials,
+ *     host and every other field are written back verbatim;
+ *   - the whole profile is re-validated with `sshProfileSchema` before the file
+ *     is written, so an invalid path/unit is refused rather than saved;
+ *   - `scope: 'auto'` edits the file that actually declares the profile
+ *     (workspace first, matching read precedence), so the model does not have to
+ *     know which file the user edited.
+ */
+export function saveLogSourceInto(
+  store: ConfigStore,
+  target: { scope: 'auto' | ConnectionScope; cwd?: string },
+  body: { profileName: string; source: SshLogSourceSpec; delete?: boolean },
+): LogSourceSaveOutcome {
+  const profileName = body.profileName.trim()
+  if (profileName.length === 0) return { ok: false, error: '缺少 SSH 配置名' }
+
+  const candidates: Array<{ scope: ConnectionScope; path: string }> = []
+  if (target.scope === 'auto' || target.scope === 'workspace') {
+    const workspacePath = connectionFilePath(store, 'workspace', target.cwd)
+    if (workspacePath !== undefined) candidates.push({ scope: 'workspace', path: workspacePath })
+    else if (target.scope === 'workspace') return { ok: false, error: '无法确定工作区配置文件路径：本次调用缺少工作区目录信息' }
+  }
+  if (target.scope === 'auto' || target.scope === 'global') {
+    candidates.push({ scope: 'global', path: connectionFilePath(store, 'global')! })
+  }
+
+  const available: string[] = []
+  for (const candidate of candidates) {
+    const label = candidate.scope === 'global' ? '全局配置文件' : '工作区配置文件'
+    const read = readConfigFile(candidate.path, label)
+    if (read.error !== undefined) return { ok: false, error: read.error }
+    const profiles = sshProfilesOf(read.raw)
+    for (const entry of profiles) {
+      if (typeof entry['name'] === 'string' && entry['name'] !== profileName) available.push(entry['name'])
+    }
+    const index = profiles.findIndex((entry) => entry['name'] === profileName)
+    if (index < 0) continue
+
+    const entry = { ...profiles[index]! }
+    const existing = Array.isArray(entry['logSources']) ? (entry['logSources'] as Array<Record<string, unknown>>) : []
+    let next: Array<Record<string, unknown>>
+    let action: 'created' | 'replaced' | 'deleted'
+    if (body.delete === true) {
+      next = existing.filter((source) => source['name'] !== body.source.name)
+      if (next.length === existing.length) {
+        return {
+          ok: false,
+          error: `SSH 配置 "${profileName}" 里没有名为 "${body.source.name}" 的日志源`,
+          path: candidate.path,
+        }
+      }
+      action = 'deleted'
+    } else {
+      const sourceEntry = { ...(body.source as unknown as Record<string, unknown>) }
+      const at = existing.findIndex((source) => source['name'] === body.source.name)
+      if (at >= 0) {
+        next = existing.slice()
+        next[at] = sourceEntry
+        action = 'replaced'
+      } else {
+        next = [...existing, sourceEntry]
+        action = 'created'
+      }
+    }
+    entry['logSources'] = next
+
+    // Re-validate the WHOLE profile: a bad path/unit is refused here, before
+    // anything reaches disk (and unrelated fields are proven intact).
+    const parsed = sshProfileSchema.safeParse(entry)
+    if (!parsed.success) {
+      return { ok: false, error: '日志源未通过校验', warnings: formatZodIssues(parsed.error), path: candidate.path }
+    }
+    profiles[index] = parsed.data as unknown as Record<string, unknown>
+    writeConfigFile(store, candidate.path, { ...(read.raw as Record<string, unknown>), sshProfiles: profiles })
+    return { ok: true, path: candidate.path, action, scope: candidate.scope }
+  }
+
+  return {
+    ok: false,
+    error: `SSH 配置 "${profileName}" 不存在（可用：${available.join('、') || '无'}）`,
+  }
+}
+
 
 /* ── duplicating a connection ────────────────────────────────────────────── */
 

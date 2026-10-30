@@ -37,7 +37,7 @@ export const DEFAULT_KNOWN_HOSTS = path.join(os.homedir(), '.ssh', 'known_hosts'
  * through `toDbFailure` unchanged: a host-key mismatch is a configuration
  * problem, not a new error class.
  */
-export type SshFailureKind = 'config' | 'auth' | 'network' | 'timeout'
+export type SshFailureKind = 'config' | 'auth' | 'network' | 'timeout' | 'permission'
 
 export class SshError extends Error {
   readonly kind: SshFailureKind
@@ -370,9 +370,15 @@ export interface SshConnectOptions {
   resolveSecret?: (raw: string) => string
   /** Test seam: connect to this local port instead of the real SSH endpoint. */
   hostOverride?: { host: string; port: number }
+  /**
+   * FR-22 two-hop: run the SSH transport over an existing stream (a
+   * `direct-tcpip` channel opened on the first hop) instead of a fresh TCP
+   * connection. Host key verification and auth are unchanged.
+   */
+  sock?: import('node:stream').Readable
 }
 
-interface SshConnection {
+export interface SshConnection {
   client: Client
   endpoint: string
   context: string
@@ -385,7 +391,7 @@ interface SshConnection {
  * configuration" click exercises exactly the same handshake a real connection
  * will perform.
  */
-async function connectSsh(profile: SshProfileSpec, options: SshConnectOptions): Promise<SshConnection> {
+export async function connectSsh(profile: SshProfileSpec, options: SshConnectOptions): Promise<SshConnection> {
   const resolveSecret = options.resolveSecret ?? resolvePassword
   const sshHost = options.hostOverride?.host ?? profile.host
   const sshPort = options.hostOverride?.port ?? profile.port ?? DEFAULT_SSH_PORT
@@ -456,6 +462,9 @@ async function connectSsh(profile: SshProfileSpec, options: SshConnectOptions): 
       port: sshPort,
       username: profile.username,
       readyTimeout: profile.readyTimeoutMs ?? 20_000,
+      // Two-hop: ssh2 drives the handshake over this stream (host/port are then
+      // only informational — the transport is the forwarded channel).
+      ...(options.sock === undefined ? {} : { sock: options.sock }),
       ...(profile.keepaliveIntervalMs === undefined ? { keepaliveInterval: 10_000 } : { keepaliveInterval: profile.keepaliveIntervalMs }),
       ...auth,
       algorithms: {

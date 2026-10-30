@@ -20,7 +20,7 @@ import { toDbFailure } from '../db/errors.js'
 import { resolvePassword } from '../secrets.js'
 import { testConnection } from '../tools/index.js'
 import type { UsageTracker } from '../usage.js'
-import type { ConnectionSpec, ConnectionTestResult, DbFailure, SshProfileSpec } from '../shared/types.js'
+import type { ConnectionSpec, ConnectionTestResult, DbFailure, ConnectionScope, SshProfileSpec } from '../shared/types.js'
 
 export const RPC_BASE_PATH = '/db-manager/api'
 export const TOKEN_GLOBAL_NAME = '__DSH_DB_MANAGER_TOKEN__'
@@ -256,7 +256,17 @@ interface StoredStatus {
   testedAt: number
 }
 
-/** Last test results per connection name, surfaced to the GUI status view. */
+/**
+ * Verdicts are keyed by scope + name — the same rule the GUI uses for its per-card
+ * state. A project connection may share a name with a global one (v0.18), so a
+ * name-only cache hands the wrong verdict to a card. `\u241f` (unit separator)
+ * cannot occur in a connection name or a workspace path.
+ */
+function statusKey(scope: ConnectionScope, name: string, workspace?: string): string {
+  return scope === 'workspace' && workspace !== undefined ? `w\u241f${workspace}\u241f${name}` : `g\u241f${name}`
+}
+
+/** Last test results, surfaced to the GUI status view. */
 const statusCache = new Map<string, ConnectionTestResult>()
 
 export function statusSnapshot(): ConnectionTestResult[] {
@@ -467,15 +477,11 @@ async function handleRpc(req: IncomingMessage, res: ServerResponse, token: strin
       case 'connections.status':
         sendJson(res, 200, { results: statusSnapshot() })
         return
-      case 'connections.testAll': {
-        const results = await testAll(deps)
-        sendJson(res, 200, { results })
-        return
-      }
       case 'connections.test': {
         const name = typeof body.name === 'string' ? body.name : ''
         // Optional workspace target so the GUI can test a single project-private
-        // connection right after saving it (without a full testAll sweep).
+        // connection, including the batched「全部测试」sweep (v0.22: the page drives
+        // the batch at concurrency 4 and folds each verdict in as it lands).
         let spec: ConnectionSpec | undefined
         let scopeCwd: string | undefined
         if (typeof body.workspace === 'string' && body.workspace.length > 0) {
@@ -498,11 +504,17 @@ async function handleRpc(req: IncomingMessage, res: ServerResponse, token: strin
           sendJson(res, 422, { error: ssh.error })
           return
         }
-        const result = await testConnection(spec, deps.connectTimeoutMs, {
+        const scope: ConnectionScope = scopeCwd === undefined ? 'global' : 'workspace'
+        const probe = await testConnection(spec, deps.connectTimeoutMs, {
           ...(scopeCwd === undefined ? {} : { workspaceRoot: scopeCwd }),
           ...(ssh.profile === undefined ? {} : { sshProfile: ssh.profile }),
         })
-        statusCache.set(name, result)
+        const result: ConnectionTestResult = {
+          ...probe,
+          scope,
+          ...(scopeCwd === undefined ? {} : { workspace: scopeCwd }),
+        }
+        statusCache.set(statusKey(scope, name, scopeCwd), result)
         sendJson(res, 200, { result })
         return
       }
@@ -724,6 +736,21 @@ function sshProfileView(entry: Record<string, unknown>, scope: 'global' | 'works
     hasPassphrase: p.auth.passphrase !== undefined,
     hasPassword: p.auth.password !== undefined,
     ...(p.knownHostsPath === undefined ? {} : { knownHostsPath: p.knownHostsPath }),
+    // FR-22: the editor needs the actual whitelist to round-trip it (it is not a
+    // secret — paths and unit names only), and the card shows the count.
+    logSourceCount: p.logSources?.length ?? 0,
+    ...(p.logSources === undefined
+      ? {}
+      : {
+          logSources: p.logSources.map((source) => ({
+            name: source.name,
+            kind: source.kind,
+            ...(source.path === undefined ? {} : { path: source.path }),
+            ...(source.unit === undefined ? {} : { unit: source.unit }),
+            ...(source.label === undefined ? {} : { label: source.label }),
+            ...(source.via === undefined ? {} : { via: source.via }),
+          })),
+        }),
   }
 }
 
@@ -829,42 +856,17 @@ function globalWarnings(store: ConfigStore): string[] {
 }
 
 /**
- * "全部测试" fan-out. Concurrency raised from 3 to 8 and the per-connection
- * wait capped at 2s: a batch run should not inherit the (user-tunable, default
- * 5s) single-connection timeout, because N unreachable hosts then cost
- * ceil(N/3)×5s (11 hosts ≈ 20s, 200 hosts ≈ 5.5min). Single-connection tests
- * (`connections.test`, `db_test_connection`) still honour the configured value.
+ * v0.22: the host no longer fans out a batch test. Two reasons:
+ *
+ * 1. the page could not show partial progress — it got one JSON body after the whole
+ *    sweep, so a slow list looked frozen and a client-side 30s abort threw away every
+ *    verdict that had already been computed;
+ * 2. the batch hid its own timeout policy (`min(connectTimeoutMs, 2s)`), so a
+ *    connection that passed the single test reported "连接超时" here.
+ *
+ * 「全部测试」now runs as `connections.test` × N from the page at concurrency 4,
+ * folding each verdict into the card as it lands (`Section.ts#testAll`).
  */
-const TEST_ALL_CONCURRENCY = 8
-const TEST_ALL_TIMEOUT_CAP_MS = 2_000
-
-async function testAll(deps: RpcDeps): Promise<ConnectionTestResult[]> {
-  const specs = findSpecAll(deps.store)
-  const results: ConnectionTestResult[] = []
-  const queue = [...specs]
-  const timeoutMs = Math.min(deps.connectTimeoutMs, TEST_ALL_TIMEOUT_CAP_MS)
-  const workers = Array.from({ length: Math.min(TEST_ALL_CONCURRENCY, queue.length) }, async () => {
-    for (;;) {
-      const spec = queue.shift()
-      if (spec === undefined) return
-      // FR-13: a batch test must exercise the same SSH path as a normal call;
-      // a broken SSH reference is reported per connection instead of aborting
-      // the whole sweep.
-      const ssh = resolveSshFor(deps.store, spec)
-      const result = ssh.error !== undefined
-        ? { name: spec.name, ok: false, errorKind: 'config' as const, message: ssh.error, testedAt: Date.now() }
-        : await testConnection(spec, timeoutMs, ssh.profile === undefined ? undefined : { sshProfile: ssh.profile })
-      statusCache.set(spec.name, result)
-      results.push(result)
-    }
-  })
-  await Promise.all(workers)
-  return results.sort((a, b) => a.name.localeCompare(b.name))
-}
-
-function findSpecAll(store: ConfigStore): ConnectionSpec[] {
-  return store.load().global.data?.connections ?? []
-}
 
 /** Strip accidental secret-looking fragments from error strings before they reach the page. */
 function sanitize(message: string): string {

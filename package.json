@@ -1,7 +1,7 @@
 {
   "name": "dsh-db-manager",
   "description": "DeepSeek Harness dual-face plugin: MySQL / PostgreSQL / SQLite connection registry with a settings-page management GUI, health tests, shadow backups, and safe AI query tools",
-  "version": "0.21.1",
+  "version": "0.22.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/suoweiyou/dsh-db-manager.git"
@@ -60,6 +60,7 @@
     "bin",
     "README.md",
     "THIRD-PARTY-NOTICES.md",
+    "docs/img",
     "cordis.patch.yml",
     "cordis.patch.example.yml"
   ],

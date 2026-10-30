@@ -12,6 +12,8 @@ import { resolveSessionInfo, resolveWorkspaceCwd } from './workspace.js'
 import { resolveTarget } from './resolve.js'
 import { buildMetadataTools } from './metadata.js'
 import { buildDataTools } from './data.js'
+import { buildLogTools } from './logs.js'
+import { DEFAULT_LOG_MAX_BYTES, DEFAULT_LOG_TIMEOUT_MS } from '../db/ssh-log.js'
 import type { RequestHumanApproval } from '../safety/approval.js'
 import type { ConnectionSpec, ConnectionTestResult, SshProfileSpec } from '../shared/types.js'
 
@@ -31,6 +33,12 @@ export interface ToolDeps {
   backupSmallThreshold: number
   /** Optional host-side human approval channel gating dangerous statements. */
   requestApproval?: RequestHumanApproval
+  /** FR-22 (v0.22): register the read-only SSH log tools (false = emergency stop). */
+  logEnabled?: boolean
+  /** FR-22: output quota per log read, in bytes (default 100000). */
+  logMaxBytes?: number
+  /** FR-22: per-read timeout in ms (default 10000). */
+  logTimeoutMs?: number
 }
 
 const CONNECTION_VIEW_SCHEMA = {
@@ -451,8 +459,18 @@ export function buildTools(deps: ToolDeps): unknown[] {
 
   // db_query / db_execute audit themselves with rich statement entries; the
   // remaining tools get a generic outcome record so every call leaves a trace.
-  const selfAudited = new Set(['db_query', 'db_execute', 'db_add_connection'])
-  return [listConnections, testConnectionTool, reloadConfig, addConnection, ...buildMetadataTools(deps), ...buildDataTools(deps)].map((tool) => {
+  const selfAudited = new Set(['db_query', 'db_execute', 'db_add_connection', 'db_read_ssh_log', 'db_search_ssh_logs', 'db_add_ssh_log_source'])
+  // FR-22: log tools are opt-out, not opt-in — an empty whitelist already means
+  // "no capability", so `logEnabled: false` is only an emergency stop.
+  const logTools = deps.logEnabled === false
+    ? []
+    : buildLogTools({
+        store: deps.store,
+        audit: deps.audit,
+        logMaxBytes: deps.logMaxBytes ?? DEFAULT_LOG_MAX_BYTES,
+        logTimeoutMs: deps.logTimeoutMs ?? DEFAULT_LOG_TIMEOUT_MS,
+      })
+  return [listConnections, testConnectionTool, reloadConfig, addConnection, ...buildMetadataTools(deps), ...buildDataTools(deps), ...logTools].map((tool) => {
     const definition = tool as { name?: string; execute?: (args: unknown, exec: unknown) => Promise<unknown> }
     if (typeof definition.name !== 'string' || typeof definition.execute !== 'function') return tool
     if (selfAudited.has(definition.name)) return tool

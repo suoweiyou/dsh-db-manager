@@ -4,7 +4,7 @@
  * additive page; the component receives `{ close }` owner props from the shell.
  */
 import { createElement as h, useCallback, useEffect, useMemo, useState, type ReactElement } from 'react'
-import { rpc, RpcError, type BuildStatusResponse, type ConnectionListItem, type ListResponse, type SshProfileView, type StatusResponse, type TableColumnView, type TableDescribeResponse, type TableIndexView, type TableListItem, type TablesListResponse, type TestResultView, type UsageResponse, type WorkspaceListItem, type WorkspacesListResponse } from './api.js'
+import { rpc, RpcError, type BuildStatusResponse, type ConnectionListItem, type ListResponse, type SshLogSourceView, type SshProfileView, type StatusResponse, type TableColumnView, type TableDescribeResponse, type TableIndexView, type TableListItem, type TablesListResponse, type TestResultView, type UsageResponse, type WorkspaceListItem, type WorkspacesListResponse } from './api.js'
 
 const C = {
   text: 'var(--dsw-alias-label-primary, #e8e8e8)',
@@ -17,6 +17,11 @@ const C = {
   bad: 'var(--dsw-alias-status-negative, #f87171)',
   idle: 'var(--dsw-alias-label-tertiary, #8a8a8a)',
   warn: 'var(--dsw-alias-status-warning, #fbbf24)',
+  // Selected-tab colours come from the shell's "ghost button, active" aliases so the
+  // highlight follows whatever theme the user picked. The nested fallbacks keep the
+  // pre-fix look on shells that do not export these tokens.
+  tabActiveBorder: 'var(--dsw-alias-button-ghost-active-border, var(--dsw-alias-label-secondary, #b8b8b8))',
+  tabActiveFill: 'var(--dsw-alias-button-ghost-active-fill, var(--dsw-alias-interactive-bg-hover, #2e2e2e))',
 }
 
 const inputStyle: Record<string, string | number> = {
@@ -48,7 +53,73 @@ const buttonStyle: Record<string, string | number> = {
 
 const primaryButtonStyle: Record<string, string | number> = { ...buttonStyle, background: C.hover }
 
-type StatusMap = Record<string, TestResultView>
+/**
+ * 「全部测试」runs as `connections.test` × N driven by the page (v0.22), four at a
+ * time. Rationale in `docs/CHANGELOG-v0.22-SSH只读日志.md`: partial progress becomes
+ * visible immediately, one hanging host cannot eat the whole request, and every
+ * probe keeps the same timeout the single-connection button uses.
+ */
+export const TEST_ALL_CONCURRENCY = 4
+const TEST_ALL_BUSY = '(全部测试)'
+
+export type StatusMap = Record<string, TestResultView>
+
+/**
+ * Fold host-reported verdicts into the per-card status map.
+ *
+ * The keys MUST be `stateKey` values — that is what `bindCard` looks up. Storing them
+ * under the bare connection name was the v0.17~v0.21 bug: the host cache and
+ * 「全部测试」both wrote `statuses['mydb']` while every card read
+ * `statuses['g␟mydb']`, so a batch sweep painted nothing and (because it replaced the
+ * map) also erased verdicts the single-card test had put in the right place.
+ */
+export function statusMapFrom(results: readonly TestResultView[]): StatusMap {
+  const map: StatusMap = {}
+  for (const result of results) {
+    map[stateKey(result.scope ?? 'global', result.name, result.workspace)] = result
+  }
+  return map
+}
+
+/**
+ * Drop verdicts whose card is gone, so a refresh cannot resurrect a stale dot.
+ *
+ * Only `g␟` (global) entries are judged: the fresh list always describes every global
+ * connection, while project connections are loaded lazily per workspace, so a global
+ * refresh says nothing about them and must not clear their dots.
+ */
+export function pruneStatusMap(map: StatusMap, liveGlobalNames: readonly string[]): StatusMap {
+  const live = new Set(liveGlobalNames.map((name) => stateKey('global', name)))
+  const next: StatusMap = {}
+  for (const [key, value] of Object.entries(map)) {
+    if (key.startsWith('w\u241f') || live.has(key)) next[key] = value
+  }
+  return next
+}
+
+/**
+ * Run `worker` over `items` with at most `concurrency` calls in flight. Results are
+ * not collected or ordered — the caller folds each one in as it lands, which is the
+ * whole point of driving the sweep from the page. A throwing worker is swallowed so
+ * one broken connection cannot abort the batch.
+ */
+export async function runPool<T>(items: readonly T[], concurrency: number, worker: (item: T) => Promise<void>): Promise<void> {
+  const queue = [...items]
+  const width = Math.max(1, Math.min(Math.trunc(concurrency), queue.length))
+  const lanes = Array.from({ length: width }, async () => {
+    for (;;) {
+      const item = queue.shift()
+      if (item === undefined) return
+      try {
+        await worker(item)
+      } catch {
+        /* keep the sweep alive; probeForStatus already turns failures into verdicts */
+      }
+    }
+  })
+  await Promise.all(lanes)
+}
+
 type EditorState =
   | { open: false }
   | {
@@ -112,6 +183,8 @@ export type SshEditorState =
       privateKeyEnv: string
       privateKeyPlain: string
       privateKeyEnc: string
+      /** FR-22: one line per log source — `name | file|journal | path|unit | label | via=name`. */
+      logSourcesText: string
     }
 
 type BrowseState =
@@ -170,7 +243,87 @@ export function emptySshEditor(scope: 'global' | 'workspace' = 'global', workspa
     privateKeyEnv: '',
     privateKeyPlain: '',
     privateKeyEnc: '',
+    logSourcesText: '',
   }
+}
+
+/* ── FR-22: log-source whitelist as editable text ────────────────────────── */
+
+/** One parsed line of the whitelist textarea (before Host-side validation). */
+export interface LogSourceDraft {
+  name: string
+  kind: 'file' | 'journal'
+  path?: string
+  unit?: string
+  label?: string
+  via?: string
+}
+
+/**
+ * Parse the settings-page textarea. One source per line:
+ *
+ *   app          | file    | /var/log/app/app.log | 应用日志
+ *   app-journal  | journal | app.service
+ *   mysql-error  | file    | /var/log/mysql/error.log | 经 db-host-prod | via=db-host-prod
+ *
+ * Blank lines and `#` comments are ignored. Errors carry the 1-based line
+ * number so the user can fix exactly that line; the Host re-validates
+ * everything anyway (this parser is convenience, not the authority).
+ */
+export function parseLogSourcesText(text: string): { sources: LogSourceDraft[]; errors: string[] } {
+  const sources: LogSourceDraft[] = []
+  const errors: string[] = []
+  text.split(/\r?\n/).forEach((rawLine, index) => {
+    const line = rawLine.trim()
+    if (line.length === 0 || line.startsWith('#')) return
+    const lineNo = index + 1
+    const parts = line.split('|').map((part) => part.trim())
+    const name = parts[0] ?? ''
+    if (name.length === 0) {
+      errors.push(`第 ${lineNo} 行：缺少日志源名称（格式：名称 | file|journal | 路径或 unit | 说明 | via=配置名）`)
+      return
+    }
+    const kindRaw = (parts[1] ?? 'file').toLowerCase()
+    if (kindRaw !== 'file' && kindRaw !== 'journal') {
+      errors.push(`第 ${lineNo} 行：kind 只能是 file 或 journal（当前 "${parts[1] ?? ''}"）`)
+      return
+    }
+    const target = parts[2] ?? ''
+    if (target.length === 0) {
+      errors.push(`第 ${lineNo} 行：缺少${kindRaw === 'file' ? '日志文件的绝对路径' : 'systemd 单元名（如 app.service）'}`)
+      return
+    }
+    if (kindRaw === 'file' && !target.startsWith('/')) {
+      errors.push(`第 ${lineNo} 行：日志路径必须是以 "/" 开头的绝对路径（当前 "${target}"）`)
+      return
+    }
+    const label = parts[3] ?? ''
+    const viaRaw = (parts[4] ?? '').replace(/^via=/i, '').trim()
+    sources.push({
+      name,
+      kind: kindRaw,
+      ...(kindRaw === 'file' ? { path: target } : { unit: target }),
+      ...(label.length === 0 ? {} : { label }),
+      ...(viaRaw.length === 0 ? {} : { via: viaRaw }),
+    })
+  })
+  return { sources, errors }
+}
+
+/** Render stored log sources back into the textarea format. */
+export function formatLogSources(sources: readonly SshLogSourceView[]): string {
+  return sources.map((source) => {
+    const cells = [
+      source.name,
+      source.kind,
+      source.kind === 'journal' ? (source.unit ?? '') : (source.path ?? ''),
+      source.label ?? '',
+      source.via === undefined ? '' : `via=${source.via}`,
+    ]
+    // Drop trailing empty cells so a plain source stays short and readable.
+    while (cells.length > 3 && cells[cells.length - 1] === '') cells.pop()
+    return cells.join(' | ')
+  }).join('\n')
 }
 
 /** Pre-fill the SSH editor from an existing profile (secrets are never回显). */
@@ -189,6 +342,7 @@ export function sshEditorFrom(item: SshProfileView, workspace?: string): SshEdit
     passwordMode: 'keep',
     passphraseMode: 'keep',
     privateKeyMode: 'keep',
+    logSourcesText: formatLogSources(item.logSources ?? []),
   }
 }
 
@@ -295,9 +449,9 @@ export function DbManagerSection(_props: { close: () => void }): ReactElement {
       setWarnings(data.warnings)
       try {
         const status = await rpc<StatusResponse>('connections.status')
-        const map: StatusMap = {}
-        for (const result of status.results) map[result.name] = result
-        setStatuses(map)
+        // Merge, don't replace: a verdict that landed while this request was in
+        // flight (the batched sweep runs concurrently with a refresh) must survive.
+        setStatuses((prev) => pruneStatusMap({ ...prev, ...statusMapFrom(status.results) }, data.connections.map((item) => item.name)))
       } catch {
         /* status cache unavailable is non-fatal */
       }
@@ -349,19 +503,60 @@ export function DbManagerSection(_props: { close: () => void }): ReactElement {
     if (workspaces.length === 0) void loadWorkspaces()
   }, [workspaces.length, loadWorkspaces])
 
-  const testAll = useCallback(async () => {
-    setBusy('(全部测试)')
+  /**
+   * Probe one connection and always come back with a verdict.
+   *
+   * Shared by the single-card「测试」button and the batched「全部测试」sweep, so both
+   * paths report the same way: a transport-level failure (or an old host without the
+   * workspace parameter) still lands on the card instead of disappearing.
+   */
+  const probeForStatus = useCallback(async (name: string, workspace?: string): Promise<TestResultView> => {
     try {
-      const data = await rpc<{ results: TestResultView[] }>('connections.testAll')
-      const map: StatusMap = {}
-      for (const result of data.results) map[result.name] = result
-      setStatuses(map)
+      const data = await rpc<{ result: TestResultView }>('connections.test', { name, ...(workspace === undefined ? {} : { workspace }) })
+      return data.result
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : String(error))
+      return {
+        name,
+        ok: false,
+        errorKind: 'unknown',
+        message: error instanceof RpcError || error instanceof Error ? error.message : String(error),
+        testedAt: Date.now(),
+      }
+    }
+  }, [])
+
+  const testAll = useCallback(async () => {
+    const targets = list.map((item) => ({ name: item.name, key: stateKey(item.scope, item.name) }))
+    if (targets.length === 0) {
+      setNotice('当前没有可测试的连接')
+      return
+    }
+    const total = targets.length
+    let done = 0
+    let failed = 0
+    setNotice(null)
+    setBusy(`${TEST_ALL_BUSY} 0/${total}`)
+    try {
+      // v0.22: the page drives the sweep, four at a time, folding each verdict into
+      // the card the moment it lands. The previous design asked the host for one
+      // big batch and could only paint the results after the last probe finished —
+      // and its results were keyed by bare name, so no card ever matched them.
+      await runPool(targets, TEST_ALL_CONCURRENCY, async (target) => {
+        const result = await probeForStatus(target.name)
+        done += 1
+        if (!result.ok) failed += 1
+        setStatuses((prev) => ({ ...prev, [target.key]: result }))
+        setBusy(`${TEST_ALL_BUSY} ${done}/${total}`)
+      })
     } finally {
       setBusy(null)
     }
-  }, [])
+    setNotice(
+      failed === 0
+        ? `全部测试完成：${total} 条连接全部可达（${formatTime(Date.now())}）`
+        : `全部测试完成：${total} 条连接中 ${failed} 条不可达，其余可达（${formatTime(Date.now())}）`,
+    )
+  }, [list, probeForStatus])
 
   const remove = useCallback(async (name: string) => {
     try {
@@ -453,6 +648,17 @@ export function DbManagerSection(_props: { close: () => void }): ReactElement {
         },
       }
       if (sshEditor.knownHostsPath.trim().length > 0) profile.knownHostsPath = sshEditor.knownHostsPath.trim()
+      // FR-22: the textarea is authoritative for the whitelist. Always send it
+      // when editing so clearing it actually clears it; on create an empty list
+      // simply means "no logs yet".
+      const logSources = parseLogSourcesText(sshEditor.logSourcesText)
+      if (logSources.errors.length > 0) {
+        setNotice(logSources.errors.join('；'))
+        return
+      }
+      if (logSources.sources.length > 0 || sshEditor.originalName !== undefined) {
+        profile.logSources = logSources.sources
+      }
       await rpc('sshProfiles.save', {
         ...(sshEditor.originalName === undefined ? {} : { originalName: sshEditor.originalName }),
         ...(sshEditor.scope === 'workspace' && sshEditor.workspace !== undefined ? { workspace: sshEditor.workspace } : {}),
@@ -492,25 +698,12 @@ export function DbManagerSection(_props: { close: () => void }): ReactElement {
   const testSingle = useCallback(async (key: string, name: string, workspace?: string) => {
     setBusy(key)
     try {
-      const data = await rpc<{ result: TestResultView }>('connections.test', { name, ...(workspace === undefined ? {} : { workspace }) })
-      setStatuses((prev) => ({ ...prev, [key]: data.result }))
-    } catch (error) {
-      // Never swallow the verdict: a transport-level failure (or an old host
-      // without the workspace parameter) must still show up on the card.
-      setStatuses((prev) => ({
-        ...prev,
-        [key]: {
-          name,
-          ok: false,
-          errorKind: 'unknown',
-          message: error instanceof RpcError || error instanceof Error ? error.message : String(error),
-          testedAt: Date.now(),
-        },
-      }))
+      const result = await probeForStatus(name, workspace)
+      setStatuses((prev) => ({ ...prev, [key]: result }))
     } finally {
       setBusy(null)
     }
-  }, [])
+  }, [probeForStatus])
 
   /** FR-13: validate one SSH configuration (reachability + host key + auth). */
   const testSshProfile = useCallback(async (name: string, workspace?: string) => {
@@ -747,16 +940,27 @@ export function DbManagerSection(_props: { close: () => void }): ReactElement {
 
   const children: ReactElement[] = []
 
-  const tabButton = (id: 'global' | 'projects' | 'ssh', label: string): ReactElement =>
-    h('button', {
+  const tabButton = (id: 'global' | 'projects' | 'ssh', label: string): ReactElement => {
+    const active = tab === id
+    return h('button', {
       key: id,
+      type: 'button',
+      'aria-pressed': active,
+      title: active ? `当前标签：${label}` : `切换到${label}`,
       style: {
         ...buttonStyle,
-        ...(tab === id ? { background: C.hover, borderColor: C.textSecondary } : {}),
         fontSize: 12,
+        // Both branches spell out the FULL `border` shorthand — never `borderColor`.
+        // Mixing the shorthand with the longhand left the *previously* selected tab
+        // with its dark border after a switch, so several tabs looked selected at once.
+        border: `1px solid ${active ? C.tabActiveBorder : C.border}`,
+        background: active ? C.tabActiveFill : 'transparent',
+        color: active ? C.text : C.textSecondary,
+        fontWeight: active ? 600 : 400,
       },
       onClick: () => { setNotice(null); setFilter(''); setTab(id) },
     }, label)
+  }
 
   // Header
   children.push(
@@ -764,7 +968,9 @@ export function DbManagerSection(_props: { close: () => void }): ReactElement {
       h('div', { style: { fontSize: 16, fontWeight: 600, color: C.text, whiteSpace: 'nowrap' } }, '数据库连接'),
       h('div', { style: { display: 'flex', gap: 8, flexShrink: 0 } },
         tab === 'global'
-          ? h('button', { style: buttonStyle, disabled: busy !== null, onClick: () => void testAll() }, busy === '(全部测试)' ? '测试中…' : '全部测试')
+          // v0.22: the batch runs from the page, so the label can show how far along
+          // it is（点点变色的同时按钮也在走数）instead of a mute「测试中…」.
+          ? h('button', { style: buttonStyle, disabled: busy !== null, onClick: () => void testAll() }, busy !== null && busy.startsWith(TEST_ALL_BUSY) ? `测试中 ${busy.slice(TEST_ALL_BUSY.length).trim()}` : '全部测试')
           : tab === 'projects'
             ? h('button', { style: buttonStyle, disabled: wsLoading, onClick: () => void loadWorkspaces() }, wsLoading ? '加载中…' : '刷新项目')
             : h('button', { style: buttonStyle, onClick: () => void refresh() }, '刷新'),
@@ -951,9 +1157,9 @@ export function DbManagerSection(_props: { close: () => void }): ReactElement {
     // connections via `sshProfile`. Secrets are write-only from here.
     children.push(
       h('div', { key: 'sshintro', style: { marginBottom: 10, padding: '8px 10px', borderRadius: 8, border: `1px solid ${C.border}`, color: C.textSecondary, fontSize: 12, lineHeight: 1.7 } },
-        'SSH 配置用于「先连跳板机、再连数据库」的场景。在连接编辑里选择一条 SSH 配置即可让该连接走隧道。',
+        'SSH 配置用于两类场景：① 数据库走隧道——在连接编辑里选中一条，该连接就会「先连跳板机、再连数据库」；② 在对话里读服务器日志——在本配置里登记日志源（普通日志文件或 systemd 单元）后，AI 就能按名称读取尾部内容，只读且不下发任何命令。同一条配置可以两者兼用。',
         h('br'),
-        '主机密钥为**严格校验**：服务器公钥必须已存在于 known_hosts（默认 ~/.ssh/known_hosts），否则连接会被拒绝——请先用 ssh 手动登录一次以写入。',
+        '主机密钥为「严格校验」：服务器公钥必须已存在于 known_hosts（默认 ~/.ssh/known_hosts），否则连接会被拒绝——请先用 ssh 手动登录一次以写入。',
       ),
     )
     if (newSshEditor !== null) children.push(newSshEditor)
@@ -1032,6 +1238,7 @@ export function renderSshCard(profile: SshProfileView, status: TestResultView | 
       h('span', { style: { fontWeight: 600, color: C.text, wordBreak: 'break-all' } }, profile.name),
       h('span', { style: { color: C.textSecondary, wordBreak: 'break-all' } }, `${profile.username ?? '?'}@${profile.host ?? '?'}:${profile.port ?? 22}`),
       h('span', { style: badgeStyle(profile.authMethod === 'agent' ? C.ok : C.textSecondary) }, sshAuthLabel(profile.authMethod)),
+      (profile.logSourceCount ?? 0) > 0 ? h('span', { style: badgeStyle(C.textSecondary) }, `日志源 ${profile.logSourceCount}`) : null,
       profile.invalid === true ? h('span', { style: badgeStyle(C.bad) }, '字段不合法') : null,
       h('span', { style: { marginLeft: 'auto', display: 'flex', gap: 6 } },
         h('button', { style: buttonStyle, disabled: busy, onClick: handlers.onTest }, busy ? '测试中…' : '测试连接'),
@@ -1156,6 +1363,18 @@ export function renderSshEditor(editor: Extract<SshEditorState, { open: true }>,
     ),
     h('div', { style: { fontSize: 12, color: C.textTertiary, lineHeight: 1.6 } },
       '主机密钥严格校验：请先用 ssh 手动登录一次该跳板机，使其公钥写入 known_hosts；非 22 端口需要 [host]:port 形式的条目。',
+    ),
+    h('label', { key: 'logSources', style: { display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, color: C.textSecondary } },
+      '日志源白名单（每行一条，供对话中的 db_read_ssh_log / db_search_ssh_logs 读取；留空表示没有可读日志）',
+      h('textarea', {
+        style: { ...inputStyle, minHeight: 84, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', whiteSpace: 'pre' },
+        value: editor.logSourcesText,
+        placeholder: 'app | file | /var/log/app/app.log | 应用日志\napp-journal | journal | app.service\nmysql-error | file | /var/log/mysql/error.log | 经 db-host-prod | via=db-host-prod',
+        onChange: (e: { target: { value: string } }) => handlers.onField({ logSourcesText: e.target.value }),
+      }),
+      h('span', { style: { color: C.textTertiary, fontSize: 11, lineHeight: 1.5 } },
+        '格式：名称 | file|journal | 路径或 systemd 单元 | 说明(可空) | via=第二跳配置名(可空)。只读：模型只能按名称读取这里声明的日志，不能执行命令或读任意文件。',
+      ),
     ),
     h('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
       h('button', { style: buttonStyle, onClick: handlers.onCancel }, '取消'),

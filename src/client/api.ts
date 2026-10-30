@@ -56,6 +56,16 @@ export interface ConnectionListItem {
   group?: string
 }
 
+/** One whitelisted read-only log source (FR-22), as the settings page sees it. */
+export interface SshLogSourceView {
+  name: string
+  kind: 'file' | 'journal'
+  path?: string
+  unit?: string
+  label?: string
+  via?: string
+}
+
 /** Credential-free SSH profile view (FR-13). */
 export interface SshProfileView {
   name: string
@@ -69,6 +79,10 @@ export interface SshProfileView {
   hasPassphrase?: boolean
   hasPassword?: boolean
   knownHostsPath?: string
+  /** FR-22: number of whitelisted log sources (badge on the card). */
+  logSourceCount?: number
+  /** FR-22: the whitelist itself, so the editor can round-trip it. */
+  logSources?: SshLogSourceView[]
   invalid?: boolean
 }
 
@@ -92,6 +106,14 @@ export interface TestResultView {
   message?: string
   hint?: string
   testedAt: number
+  /**
+   * v0.22: which config file the probe targeted. The page keys verdicts by scope +
+   * name (`stateKey`), so results coming from the host cache need these to find
+   * their card. Absent on results produced by `connections.test` before v0.22 and
+   * on `db_test_connection` output (which never reaches the page).
+   */
+  scope?: 'global' | 'workspace'
+  workspace?: string
 }
 
 export interface ListResponse {
